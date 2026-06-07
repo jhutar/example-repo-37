@@ -1,35 +1,62 @@
-# Install the app dependencies in a full Node docker image
-FROM registry.access.redhat.com/ubi10/nodejs-22:latest
+# Builder for Go
+# (this is to avoid installing all Golang dependencies to our runner image)
+FROM registry.access.redhat.com/ubi10/go-toolset:latest AS builder_go
+# Download dependencies based on just these two files to be able to cache the layer
+COPY go.mod go.sum ./
+RUN go mod download -x
+# Copy rest of the source code and build it
+COPY . .
+RUN make build
+# Test executable is OK
+RUN ./bin/loadtest --help
 
-# Copy package.json, and optionally package-lock.json if it exists
-COPY package.json package-lock.json* ./
 
-# Install app dependencies
-RUN \
-  if [ -f package-lock.json ]; then npm ci; \
-  else npm install; \
-  fi
 
-# Copy the dependencies into a Slim Node docker image
-FROM registry.access.redhat.com/ubi10/nodejs-22-minimal:latest
+# Builder for oc
+# (this is to avoid installing tar to our runner image)
+FROM registry.access.redhat.com/ubi10/ubi:latest AS builder_oc
+# Download and install it, try multiple times as this is error prone
+RUN attempt=1; \
+    while true; do \
+        echo "Attempt $attempt"; \
+        curl -v -L https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/stable/openshift-client-linux.tar.gz -o /tmp/openshift-client-linux.tar.gz && \
+            tar zxvf /tmp/openshift-client-linux.tar.gz -C /usr/bin/ && \
+            break; \
+        if [[ $attempt -ge 5 ]]; then \
+            echo "All attempts failed, giving up" >&2; \
+            exit 1; \
+        fi; \
+        sleep 1; \
+        let attempt+=1; \
+    done
+# Test it was installed correctly
+RUN oc version --client
 
-# Include licences
+
+
+# Runner
+FROM registry.access.redhat.com/ubi10/python-312-minimal:latest
+# Include license information required by Red Hat certification
 COPY LICENSE /licenses/LICENSE
-
-# Install app dependencies
-COPY --from=0 /opt/app-root/src/node_modules /opt/app-root/src/node_modules
-COPY . /opt/app-root/src
-
-# Set these labels not to inherit from parent container
-LABEL com.redhat.component="nodejs-devfile-sample"
-LABEL description="Description of nodejs-devfile-sample"
-LABEL io.k8s.description="Description of nodejs-devfile-sample"
-LABEL io.k8s.display-name="nodejs-devfile-sample"
-LABEL io.openshift.tags="perfscaletest"
-LABEL name="nodejs-devfile-sample"
-LABEL summary="Summary of nodejs-devfile-sample"
-
-ENV NODE_ENV production
-ENV PORT 3001
-
-CMD ["npm", "start"]
+# Copy loadtest binary from builder container
+COPY --from=builder_go /opt/app-root/src/bin/loadtest /usr/bin/
+# Copy OpenShift CLI binary from builder container
+COPY --from=builder_oc /usr/bin/oc /usr/bin/
+COPY --from=builder_oc /usr/bin/kubectl /usr/bin/
+# Install internal CA certificate
+COPY ci-scripts/config/2022-IT-Root-CA.pem \
+     /etc/pki/ca-trust/source/anchors/2022-IT-Root-CA.pem
+USER 0
+RUN update-ca-trust
+# Install dependencies for our python scripts
+RUN INSTALL_PKGS="git-core jq tar xz" && \
+    microdnf -y --setopt=tsflags=nodocs --setopt=install_weak_deps=0 install $INSTALL_PKGS && \
+    microdnf -y clean all --enablerepo='*'
+USER 1001
+RUN python3 -m pip install -U pip && \
+    python3 -m pip install "git+https://github.com/redhat-performance/opl.git#egg=opl-rhcloud-perf-team-core&subdirectory=core" && \
+    python3 -m pip install tabulate matplotlib
+# Install our scripts
+COPY ci-scripts/ \
+     ./ci-scripts/
+CMD ["sleep", "5d"]
